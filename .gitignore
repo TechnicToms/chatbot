@@ -4,6 +4,9 @@
 # Don't upload the Datasets
 datasets/
 
+# Don't show the secrets
+secret_keys.txt
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]

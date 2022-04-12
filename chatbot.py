@@ -13,6 +13,16 @@ class ChatBot:
         self.tc = TerminalColor
         print(self.tc.info + f"Starting Chatbot, \u001b[4m{name}\u001b[0m!")
 
+    def answer(self, user_input: str):
+        """
+        Here the Chatbot gives an answer ... (TODO)
+
+        :param user_input: Input Text of user
+        :type user_input: str
+        :return: Answer of Chatbot
+        """
+        pass
+
 
 if __name__ == "__main__":
     ai = ChatBot()
