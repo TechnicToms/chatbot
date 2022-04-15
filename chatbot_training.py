@@ -2,21 +2,13 @@ import numpy as np
 import tweepy
 import tqdm
 
-import matplotlib.pyplot as plt
-import matplotlib.ticker as ticker
-
 import tensorflow as tf
 from tensorflow import keras
 import tensorflow_addons as tfa
 
-from sklearn.model_selection import train_test_split
-
-import unicodedata
 import re
-
 import os
-import io
-import time
+import threading
 
 
 class TerminalColor:
@@ -26,6 +18,7 @@ class TerminalColor:
     warning = "\u001b[1m\u001b[33;1m[WARNING] \u001b[0m"
 
 
+# TODO: Add Buffer for lage Text files
 class data_loader:
     num_encoder_tokens = 0
     num_decoder_tokens = 0
@@ -37,6 +30,9 @@ class data_loader:
         :param dataset: Selected Dataset. Possible answers ['chat-corpus', 'kaggle-1']
         :type dataset: str
         """
+        self.decoder_target_data = np.array([])
+        self.decoder_input_data = np.array([])
+        self.encoder_input_data = np.array([])
         self.dataset = []
         self.target_tokens = []
         self.input_tokens = []
@@ -44,11 +40,19 @@ class data_loader:
         self.tc = TerminalColor
 
         if dataset == "chat-corpus":
-            self.load_tweets_textfile("datasets/Chat corpus/twitter_en_big.txt")
+            with open("datasets/Chat corpus/twitter_en_big.txt", "r") as fileReader:
+                lines = fileReader.readlines()
+                dataset_tmp = [line.rstrip('\n') for line in lines]
+
+            for i in range(0, len(dataset_tmp), 2):
+                self.dataset.append((dataset_tmp[i], dataset_tmp[i + 1]))
+
+            print(self.tc.success + f"Found {len(self.dataset)} messages pairs!")
+            self.tokenize()
         if dataset == "kaggle-1":
             with open("datasets/kaggle/chatbot-1/dialogs.txt", "r") as fileReader:
                 lines = fileReader.readlines()
-                self.dataset = [line.split('-|-') for line in lines]
+                self.dataset = [line.rstrip('\n').split('-|-') for line in lines]
             print(self.tc.success + f"Found {len(self.dataset)} messages pairs!")
 
             self.tokenize()
@@ -113,18 +117,6 @@ class data_loader:
             print(self.tc.warning + f"{missing_tweets} tweets could not be loaded because they no longer exist!")
         print(self.tc.success + "Loaded Data!")
 
-    def load_tweets_textfile(self, textfile_path):
-        """
-        Loads the Messages from a text file
-
-        :param textfile_path: Path to file
-        :type textfile_path: str
-        :return: Sets Dataset List
-        """
-        with open(textfile_path, "r") as fileReader:
-            self.dataset = fileReader.readlines()
-        print(self.tc.success + f"Found {len(self.dataset)} Messages!")
-
     def tokenize(self):
         """
         Tokenizes the Dataset!
@@ -173,52 +165,106 @@ class data_loader:
         # Maximum length of sentences in input and target documents
         max_encoder_seq_length = max([len(re.findall(r"[\w']+|[^\s\w]", input_doc)) for input_doc in input_docs])
         max_decoder_seq_length = max([len(re.findall(r"[\w']+|[^\s\w]", target_doc)) for target_doc in target_docs])
-        encoder_input_data = np.zeros(
+        self.encoder_input_data = np.zeros(
             (len(input_docs), max_encoder_seq_length, self.num_encoder_tokens),
             dtype='float32')
-        decoder_input_data = np.zeros(
+        self.decoder_input_data = np.zeros(
             (len(input_docs), max_decoder_seq_length, self.num_decoder_tokens),
             dtype='float32')
-        decoder_target_data = np.zeros(
+        self.decoder_target_data = np.zeros(
             (len(input_docs), max_decoder_seq_length, self.num_decoder_tokens),
             dtype='float32')
 
         for line, (input_doc, target_doc) in enumerate(zip(input_docs, target_docs)):
             for timestep, token in enumerate(re.findall(r"[\w']+|[^\s\w]", input_doc)):
                 # Assign 1. for the current line, timestep, & word in encoder_input_data
-                encoder_input_data[line, timestep, input_features_dict[token]] = 1.
+                self.encoder_input_data[line, timestep, input_features_dict[token]] = 1.
 
             for timestep, token in enumerate(target_doc.split()):
-                decoder_input_data[line, timestep, target_features_dict[token]] = 1.
+                self.decoder_input_data[line, timestep, target_features_dict[token]] = 1.
                 if timestep > 0:
-                    decoder_target_data[line, timestep - 1, target_features_dict[token]] = 1.
+                    self.decoder_target_data[line, timestep - 1, target_features_dict[token]] = 1.
 
         print(self.tc.success + "Tokenized!")
 
     def get_sample(self):
         choosen = np.random.randint(0, len(self))
-        return self.input_tokens[choosen]
+        return self.encoder_input_data[choosen, 0, :]
 
 
-class Encoder(tf.keras.Model):
-    def __init__(self, num_encoder_tokens, dimensionality):
+class MyLSTM(tf.keras.Model):
+    def __init__(self, num_encoder_tokens, num_decoder_tokens, dimensionality):
         super().__init__(self)
         # Build Encoder
-        encoder_inputs = tf.keras.layers.Input(shape=(None, num_encoder_tokens))
-        encoder_lstm = tf.keras.layers.LSTM(dimensionality, return_state=True)
-        encoder_outputs, state_hidden, state_cell = encoder_lstm(encoder_inputs)
-        encoder_states = [state_hidden, state_cell]
+        self.encoder_inputs = tf.keras.layers.Input(shape=(None, num_encoder_tokens))
+        self.encoder_lstm = tf.keras.layers.LSTM(dimensionality, return_state=True)
+        self.encoder_outputs, state_hidden, state_cell = self.encoder_lstm(self.encoder_inputs)
+        self.encoder_states = [state_hidden, state_cell]
+
+        self.decoder_inputs = tf.keras.layers.Input(shape=(None, num_decoder_tokens))
+        self.decoder_lstm = tf.keras.layers.LSTM(dimensionality, return_sequences=True, return_state=True)
+        self.decoder_outputs, decoder_state_hidden, decoder_state_cell = self.decoder_lstm(self.decoder_inputs,
+                                                                                           initial_state=self.encoder_states)
+        self.decoder_dense = tf.keras.layers.Dense(num_decoder_tokens, activation='softmax')
+        self.decoder_outputs = self.decoder_dense(self.decoder_outputs)
+
+        self.training_model = tf.keras.Model([self.encoder_inputs, self.decoder_inputs], self.decoder_outputs)
+
+    def call(self, inputs):
+        return self.training_model(inputs)
+
+
+def launchTensorBoard(tensorboard_path):
+    os.system('tensorboard --logdir=' + tensorboard_path)
+    return
+
+
+class training_unit:
+    def __init__(self, EPOCHS, BATCH_SIZE, dimensionality=256):
+        self.data = data_loader("chat-corpus")  # chat-corpus, kaggle-1
+        self.dimensionality = dimensionality
+        self.EPOCHS = EPOCHS
+        self.BATCH_SIZE = BATCH_SIZE
+
+        split = 0.7  # 70% train dataset
+        self.split_point = int(split * len(self.data))
+
+        self.log_dir = "logs/first-try"
+        self.tensorboard_callback = tf.keras.callbacks.TensorBoard(log_dir=self.log_dir, histogram_freq=1)
+
+        self.train_metrics = ['accuracy', tf.metrics.AUC(), tf.metrics.KLDivergence(),
+                              tf.metrics.CosineSimilarity(), tf.metrics.MeanSquaredError()]
+        self.model = MyLSTM(self.data.num_encoder_tokens, self.data.num_decoder_tokens, self.dimensionality)
+        self.model.compile(optimizer='rmsprop', loss='categorical_crossentropy', metrics=self.train_metrics,
+                           sample_weight_mode='temporal')
+
+        # Launch Tensorboard
+        t = threading.Thread(target=launchTensorBoard, args=([self.log_dir]))
+        t.start()
+
+    def train(self):
+        # Training
+        print(TerminalColor.info + "Start of training ...")
+        self.model.fit([self.data.encoder_input_data[0:self.split_point, :, :],
+                        self.data.decoder_input_data[0:self.split_point, :, :]],
+                       self.data.decoder_target_data[0:self.split_point, :, :],
+                       batch_size=self.BATCH_SIZE, epochs=self.EPOCHS, validation_split=0.2,
+                       callbacks=[self.tensorboard_callback])
+        self.model.save('training_model.h5')
+
+    def test(self):
+        results = self.model.evaluate([self.data.encoder_input_data[self.split_point:, :, :],
+                                       self.data.decoder_input_data[self.split_point:, :, :]],
+                                      self.data.decoder_target_data[self.split_point:, :, :])
+        print(results)
 
 
 if __name__ == '__main__':
-    data = data_loader("kaggle-1")
-    print(data.get_sample())
+    BATCH_SIZE = 10
+    EPOCHS = 600
 
-    BUFFER_SIZE = 32000
-    BATCH_SIZE = 64
-    EPOCHS = 10
-    # Let's limit the #training examples for faster training
-    num_examples = 30000
-    # tu = training_unit(BATCH_SIZE, EPOCHS, BUFFER_SIZE, num_examples)
+    tu = training_unit(EPOCHS, BATCH_SIZE, dimensionality=256)
+    tu.train()
+    tu.test()
 
     print("finished!")
